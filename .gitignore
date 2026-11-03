@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+# Secrets and local config
+.env
+*.key
+# Generated data and artefacts
+data/processed/*
+!data/processed/.gitkeep
+*.log
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,7 @@
+# Proposed dependencies; confirm in docs/decisions/ and trim to what is used.
+paho-mqtt
+pandas
+numpy
+scikit-learn
+influxdb-client
+pytest

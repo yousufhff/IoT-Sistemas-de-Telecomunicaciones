@@ -1,0 +1,1828 @@
+diff --git a/demos/edge1000-v4/cloud/analysis.py b/demos/edge1000-v4/cloud/analysis.py
+index f3030e7..38d91f2 100644
+--- a/demos/edge1000-v4/cloud/analysis.py
++++ b/demos/edge1000-v4/cloud/analysis.py
+@@ -1,35 +1,75 @@
+-"""Non-critical calculation offloaded when the measured link is healthy."""
++"""Non-critical calculation offloaded when the measured link is healthy.
++
++Summaries are per zone (4x4 node blocks). The legacy network-wide format
++(no zone field) is still accepted.
++"""
+ 
+ from edge.transport import aggregate
++from .readings import node_name
+ import math
++import re
++
++ZONE = re.compile(r"z_\d{1,2}_\d{1,2}")
++
++
++def _finite(x):
++    return type(x) in (float, int) and math.isfinite(x)
++
++
++def _span(value):
++    if type(value) in (int, float) and math.isfinite(value):
++        return value
++    if isinstance(value, str) and 0 < len(value) <= 64:
++        return value
++    raise ValueError("Invalid time bound")
+ 
+ 
+ def summarize(data):
+     mode = data["computed_by"]
++    zone = data.get("zone")
++    extra = {}
++    if zone is not None:
++        if not isinstance(zone, str) or not ZONE.fullmatch(zone):
++            raise ValueError("Invalid zone")
++        extra = dict(
++            zone=zone, from_ts=_span(data["from_ts"]), to_ts=_span(data["to_ts"])
++        )
+     if mode == "cloud":
+         samples = data["samples"]
+-        if (
+-            not isinstance(samples, list)
+-            or not 1 <= len(samples) <= 512
+-            or not all(type(x) in (float, int) and math.isfinite(x) for x in samples)
+-        ):
++        if not isinstance(samples, list) or not 1 <= len(samples) <= 512:
+             raise ValueError("Invalid samples")
+-        result = aggregate(samples)
++        if zone is not None:
++            if not all(
++                isinstance(s, dict)
++                and node_name(s.get("node_id")) is not None
++                and _finite(s.get("pm25"))
++                for s in samples
++            ):
++                raise ValueError("Invalid zone samples")
++            peak = max(samples, key=lambda s: s["pm25"])
++            result = aggregate([s["pm25"] for s in samples])
++            extra["max_node_id"] = node_name(peak["node_id"])
++        else:
++            if not all(_finite(x) for x in samples):
++                raise ValueError("Invalid samples")
++            result = aggregate(samples)
+     elif mode == "edge":
+         result = {k: data[k] for k in ("n", "mean_pm25", "max_pm25")}
+         if (
+             type(result["n"]) != int
+             or not 1 <= result["n"] <= 512
+-            or not all(
+-                type(result[k]) in (float, int) and math.isfinite(result[k])
+-                for k in ("mean_pm25", "max_pm25")
+-            )
++            or not all(_finite(result[k]) for k in ("mean_pm25", "max_pm25"))
+         ):
+             raise ValueError("Invalid summary")
++        if zone is not None:
++            if node_name(data.get("max_node_id")) is None:
++                raise ValueError("Invalid max_node_id")
++            extra["max_node_id"] = node_name(data["max_node_id"])
+     else:
+         raise ValueError("Invalid routing mode")
+     return dict(
+         **result,
++        **extra,
+         computed_by=mode,
+         generated_at=data["generated_at"],
+         event_id=data["event_id"],
+diff --git a/demos/edge1000-v4/cloud/app.py b/demos/edge1000-v4/cloud/app.py
+index 6ec1f75..3e8de4f 100644
+--- a/demos/edge1000-v4/cloud/app.py
++++ b/demos/edge1000-v4/cloud/app.py
+@@ -1,7 +1,7 @@
+ """WildfireSense local central receiver: MQTT QoS 1 -> durable SQLite -> HTTP UI.
+ 
+ This is a local Cloud *emulator* on the Docker network, not an Internet cloud.
+-No sensor readings are subscribed to or stored; only official Edge alerts.
++Official Edge alerts are the immutable log; reading batches are kept in a bounded window.
+ """
+ 
+ from __future__ import annotations
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ from edge.transport import ACK, PING, PONG, STATS, SUMMARY, wire
+ from .analysis import summarize
+ from .incidents import group_suspected_fire
++from . import readings as rd
++from . import labels as lb
+ import hashlib
+ from contextlib import contextmanager
+ import json
+@@ -37,6 +39,7 @@ class AlertStore:
+ 
+     def __init__(self, db_path: str | Path):
+         self.db_path = str(db_path)
++        self.on_labels = None
+         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+         with self.connect() as conn:
+             conn.execute("PRAGMA journal_mode=WAL")
+@@ -56,6 +59,7 @@ class AlertStore:
+             conn.execute(
+                 "CREATE TABLE IF NOT EXISTS summaries(id TEXT PRIMARY KEY,payload TEXT)"
+             )
++            rd.create_tables(conn)
+             conn.execute(
+                 "CREATE INDEX IF NOT EXISTS idx_alerts_node ON alerts(node_id)"
+             )
+@@ -144,6 +148,15 @@ class AlertStore:
+             else "conflict"
+         )
+ 
++    def ingest_readings(self, payload: bytes, window_s: int = rd.WINDOW_S):
++        """Returns (inserted|duplicate|invalid, batch_id, inserted, duplicates)."""
++        with self.connect() as conn:
++            return rd.ingest_batch(conn, payload, window_s)
++
++    def readings(self, **filters):
++        with self.connect() as conn:
++            return rd.query(conn, **filters)
++
+     def ingest_summary(self, payload: bytes) -> tuple[str, str | None]:
+         """Validate and persist one aggregated window before application-level ACK.
+ 
+@@ -224,9 +237,32 @@ class AlertStore:
+             ).fetchall()
+         return [json.loads(row["payload"]) for row in rows]
+ 
++    def incident_list(self):
++        """All incidents (grouping over the immutable alert log) with timelines."""
++        return self._incidents(10**9)[1]
++
+     def incidents(self, limit: int = 100):
+         """Derived view; never changes the immutable alert event log."""
+         limit = max(1, min(200, int(limit)))
++        candidates, incidents = self._incidents(limit)
++        with self.connect() as conn:
++            labels = lb.effective(conn)
++        for item in incidents[:limit]:
++            label = labels.get(item["incident_id"])
++            item["label"] = (
++                dict(label=label[0], true_class=label[1], source=label[2])
++                if label
++                else None
++            )
++        return dict(
++            total_incidents=len(incidents),
++            suspected_fire_events=len(candidates),
++            incidents=incidents[:limit],
++            grouping_note=("Agrupacion experimental por run_id, ocho celdas vecinas "
++                           "y 30 minutos; no equivale a incendios reales"),
++        )
++
++    def _incidents(self, limit):
+         with self.connect() as conn:
+             rows = conn.execute(
+                 "SELECT event_hash, node_id, generated_at, received_at, payload_json "
+@@ -252,13 +288,64 @@ class AlertStore:
+                 test_only=payload.get("test_only"),
+             ))
+         incidents = group_suspected_fire(candidates)
+-        return dict(
+-            total_incidents=len(incidents),
+-            suspected_fire_events=len(candidates),
+-            incidents=incidents[:limit],
+-            grouping_note=("Agrupacion experimental por run_id, ocho celdas vecinas "
+-                           "y 30 minutos; no equivale a incendios reales"),
+-        )
++        with self.connect() as conn:
++            for item in incidents[:limit]:
++                start = rd._ts_ms(item["first_seen"])
++                end = rd._ts_ms(item["last_seen"])
++                item["peak_pm25"] = rd.peak_pm25(
++                    conn,
++                    item["run_id"],
++                    [step["node"] for step in item["timeline"]],
++                    start - 600_000,
++                    end + 600_000,
++                )
++        return candidates, incidents
++
++    def set_label(self, incident_id, label, true_class):
++        if incident_id not in {i["incident_id"] for i in self.incident_list()}:
++            raise KeyError(incident_id)
++        with self.connect() as conn:
++            cls = lb.set_label(conn, incident_id, label, true_class, "manual")
++        if self.on_labels:
++            self.on_labels()
++        return cls
++
++    def load_truth(self, run_id, truth):
++        """Store the scenario truth and label that run's incidents. Returns count."""
++        incidents = [i for i in self.incident_list() if i["run_id"] == run_id]
++        with self.connect() as conn:
++            lb.save_truth(conn, run_id, truth)
++            done = lb.label_from_truth(conn, incidents)
++        if self.on_labels:
++            self.on_labels()
++        return done
++
++    def export_training(self, path):
++        """Write verified labelled readings as JSONL for lab/train.py --extra."""
++        incidents = self.incident_list()
++        n = 0
++        with self.connect() as conn, open(path, "w", encoding="utf-8") as out:
++            for row in lb.training_rows(conn, incidents):
++                out.write(json.dumps(row, separators=(",", ":")) + "\n")
++                n += 1
++        return n
++
++    def nodes(self):
++        with self.connect() as conn:
++            return [dict(r) for r in conn.execute("SELECT * FROM nodes ORDER BY node_id")]
++
++    def zones(self):
++        """Latest summary per zone (derived from the summaries table)."""
++        latest = {}
++        with self.connect() as conn:
++            rows = conn.execute(
++                "SELECT payload FROM summaries ORDER BY rowid DESC LIMIT 5000"
++            ).fetchall()
++        for row in rows:
++            data = json.loads(row["payload"])
++            if "zone" in data and data["zone"] not in latest:
++                latest[data["zone"]] = data
++        return sorted(latest.values(), key=lambda d: d["zone"])
+ 
+     def stats(self):
+         with self.connect() as conn:
+@@ -274,6 +361,7 @@ class AlertStore:
+             last = conn.execute(
+                 "SELECT received_at FROM alerts ORDER BY id DESC LIMIT 1"
+             ).fetchone()
++            readings_info = rd.counts(conn)
+         counts = {r["alert_type"]: r["n"] for r in rows}
+         return {
+             "last_summary": json.loads(summary[0]) if summary else None,
+@@ -282,6 +370,7 @@ class AlertStore:
+             "environmental_alerts": counts.get("environmental_alert", 0),
+             "sos_alerts": counts.get("sos_alert", 0),
+             "last_received_at": last["received_at"] if last else None,
++            **readings_info,
+         }
+ 
+ 
+@@ -293,7 +382,7 @@ class BrokerStatus:
+         self.last_error = None
+ 
+ 
+-def build_handler(store: AlertStore, status: BrokerStatus):
++def build_handler(store: AlertStore, status: BrokerStatus, retrainer=None):
+     dashboard = Path(__file__).with_name("dashboard.html").read_bytes()
+ 
+     class Handler(BaseHTTPRequestHandler):
+@@ -340,6 +429,39 @@ def build_handler(store: AlertStore, status: BrokerStatus):
+                             or int(raw_limit) == 0):
+                         return self.json_error(400, "limit debe ser entero de 1 a 200")
+                     data = store.incidents(min(int(raw_limit), 200))
++                elif uri.path == "/api/models":
++                    if retrainer is None:
++                        return self.json_error(404, "reentrenamiento no activo")
++                    data = retrainer.state()
++                elif uri.path == "/api/readings":
++                    def number(name):
++                        raw = query.get(name, [None])[0]
++                        if raw is None:
++                            return None
++                        if not raw.lstrip("-").isdigit() or len(raw) > 16:
++                            raise ValueError(name)
++                        return int(raw)
++
++                    try:
++                        raw_node = query.get("node_id", [None])[0]
++                        node = rd.node_name(raw_node) if raw_node else None
++                        if raw_node and node is None:
++                            raise ValueError("node_id")
++                        data = {
++                            "readings": store.readings(
++                                run_id=query.get("run_id", [None])[0],
++                                node_id=node,
++                                since_ms=number("since"),
++                                until_ms=number("until"),
++                                limit=number("limit") or 500,
++                            )
++                        }
++                    except ValueError as exc:
++                        return self.json_error(400, f"parametro invalido: {exc}")
++                elif uri.path == "/api/nodes":
++                    data = {"nodes": store.nodes()}
++                elif uri.path == "/api/zones":
++                    data = {"zones": store.zones()}
+                 elif uri.path == "/api/alerts":
+                     raw_limit = query.get("limit", ["100"])[0]
+                     if (
+@@ -369,6 +491,47 @@ def build_handler(store: AlertStore, status: BrokerStatus):
+                 LOGGER.exception("HTTP database error: %s", exc)
+                 return self.json_error(503, "base de datos no disponible")
+ 
++        def do_POST(self):
++            try:
++                path = urlparse(self.path).path
++                length = int(self.headers.get("Content-Length", "0"))
++                if not 0 < length <= 1 << 20:
++                    return self.json_error(400, "cuerpo vacio o demasiado grande")
++                body = json.loads(self.rfile.read(length).decode("utf-8"))
++                if not isinstance(body, dict):
++                    return self.json_error(400, "se espera un objeto JSON")
++                if path == "/api/labels":
++                    cls = store.set_label(
++                        body.get("incident_id"), body.get("label"), body.get("true_class")
++                    )
++                    data = {"incident_id": body["incident_id"], "true_class": cls}
++                elif path in ("/api/retrain", "/api/models/promote", "/api/models/rollback"):
++                    if retrainer is None:
++                        return self.json_error(404, "reentrenamiento no activo")
++                    if path == "/api/retrain":
++                        if retrainer.lock.locked():
++                            return self.json_error(409, "reentrenamiento en curso")
++                        threading.Thread(
++                            target=retrainer.run, args=("manual",), daemon=True
++                        ).start()
++                        data = {"started": True}
++                    elif path == "/api/models/promote":
++                        data = {"active": retrainer.promote(body.get("version"))}
++                    else:
++                        data = {"active": retrainer.rollback()}
++                elif path == "/api/truth":
++                    data = {"labelled": store.load_truth(body.get("run_id"), body.get("truth"))}
++                else:
++                    return self.json_error(404, "no encontrado")
++                return self.respond(200, json.dumps(data).encode("utf-8"))
++            except KeyError:
++                return self.json_error(404, "incidente desconocido")
++            except (ValueError, UnicodeDecodeError):
++                return self.json_error(400, "peticion invalida")
++            except (OSError, sqlite3.Error) as exc:
++                LOGGER.exception("HTTP database error: %s", exc)
++                return self.json_error(503, "base de datos no disponible")
++
+         def json_error(self, code, message):
+             return self.respond(code, json.dumps({"error": message}).encode())
+ 
+@@ -378,8 +541,10 @@ def build_handler(store: AlertStore, status: BrokerStatus):
+     return Handler
+ 
+ 
+-def serve_http(store: AlertStore, status: BrokerStatus, host="0.0.0.0", port=8080):
+-    server = ThreadingHTTPServer((host, port), build_handler(store, status))
++def serve_http(
++    store: AlertStore, status: BrokerStatus, host="0.0.0.0", port=8080, retrainer=None
++):
++    server = ThreadingHTTPServer((host, port), build_handler(store, status, retrainer))
+     LOGGER.info("HTTP_READY %s:%s", host, server.server_port)
+     server.serve_forever()
+ 
+@@ -393,7 +558,7 @@ def run_mqtt(store: AlertStore, status: BrokerStatus, host: str, port: int):
+             LOGGER.error("MQTT_CONNECT_FAILED %s", reason_code)
+             return
+         result, mid = client.subscribe(
+-            [(TOPIC, 1), (PING, 0), (SUMMARY, 1), (STATS, 0)]
++            [(TOPIC, 1), (PING, 0), (SUMMARY, 1), (STATS, 0), (rd.READINGS_TOPIC, 1)]
+         )
+         if result != mqtt.MQTT_ERR_SUCCESS:
+             status.connected.clear()
+@@ -415,6 +580,19 @@ def run_mqtt(store: AlertStore, status: BrokerStatus, host: str, port: int):
+ 
+     def on_message(client, userdata, msg):
+         try:
++            if msg.topic == rd.READINGS_TOPIC:
++                result, batch_id, added, dup = store.ingest_readings(msg.payload)
++                if result in ("inserted", "duplicate"):
++                    client.publish(ACK, wire(dict(event_id=batch_id)), qos=1)
++                    LOGGER.info(
++                        "READINGS_STORED batch=%s inserted=%s duplicates=%s",
++                        batch_id,
++                        added,
++                        dup,
++                    )
++                else:
++                    LOGGER.warning("READINGS_REJECTED invalid batch")
++                return
+             if len(msg.payload) > MAX_PAYLOAD_BYTES:
+                 return
+             if msg.topic == STATS:
+@@ -501,7 +679,20 @@ def main():
+         name="mqtt-subscriber",
+     )
+     mqtt_thread.start()
+-    serve_http(store, status, port=int(os.environ.get("HTTP_PORT", "8080")))
++    retrainer = None
++    if os.environ.get("CLOUD_RETRAIN", "1") == "1":
++        from .retrain import Retrainer
++
++        retrainer = Retrainer(
++            store,
++            Path(os.environ.get("CLOUD_DB_PATH", "/app/data/alerts.sqlite3")).parent
++            / "retrain",
++            trigger_labels=int(os.environ.get("RETRAIN_TRIGGER_LABELS", "10")),
++        )
++        store.on_labels = retrainer.maybe_trigger
++    serve_http(
++        store, status, port=int(os.environ.get("HTTP_PORT", "8080")), retrainer=retrainer
++    )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/demos/edge1000-v4/cloud/dashboard.html b/demos/edge1000-v4/cloud/dashboard.html
+index e827fd1..94df551 100644
+--- a/demos/edge1000-v4/cloud/dashboard.html
++++ b/demos/edge1000-v4/cloud/dashboard.html
+@@ -6,7 +6,16 @@
+   <title>WildfireSense · Centro de control local</title>
+   <style>
+   :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#eaf2f4;background:#0a131b;font-synthesis:none}*{box-sizing:border-box}body{margin:0}header{padding:30px max(22px,calc((100vw - 1150px)/2));background:linear-gradient(115deg,#112534,#172c30 65%,#263c2c);border-bottom:1px solid #2c444d}.brand{display:flex;align-items:center;gap:14px}.mark{font-size:34px}.eyebrow{text-transform:uppercase;letter-spacing:.18em;font-size:11px;color:#8cb7ac}h1{margin:4px 0 0;font-size:clamp(26px,4vw,38px);font-weight:750;letter-spacing:-.04em}header p{color:#c2d0d4;line-height:1.55;max-width:720px}.page{max-width:1150px;margin:0 auto;padding:24px 22px 70px}.status{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}.pill{border:1px solid #385157;background:#22353a;border-radius:40px;padding:8px 12px;font-size:13px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#d9aa5e;margin-right:8px}.dot.ok{background:#4fd4a6}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:22px}.card{background:#14232d;border:1px solid #2d414b;padding:20px;border-radius:15px}.card span{display:block;color:#a9bdc5;font-size:13px}.value{display:block;font-size:34px;font-weight:740;margin-top:8px;letter-spacing:-.04em}.value.critical{color:#ff9c8c}.value.high{color:#ffd28a}h2{font-size:19px;margin:0}.section{background:#13212b;border:1px solid #2d414b;border-radius:15px;overflow:hidden}.sectionhead{padding:20px;display:flex;align-items:center;justify-content:space-between;gap:12px}.hint{font-size:12px;color:#9bb0b9}table{border-collapse:collapse;width:100%}thead{background:#192c36}th{text-align:left;font-size:12px;font-weight:600;letter-spacing:.04em;color:#9fbac4;padding:13px 16px}td{border-top:1px solid #293e46;padding:15px 16px;font-size:13px}td .muted{color:#a1b7c0}.tag{padding:5px 8px;border-radius:6px;font-size:11px;font-weight:750;letter-spacing:.04em}.tag.sos{background:#4e2a2e;color:#ffaaa4}.tag.env{background:#59432a;color:#ffd28a}.tablewrap{overflow-x:auto}#empty{text-align:center;padding:36px;color:#a7bcc6}footer{font-size:12px;color:#90a8b2;line-height:1.6;margin-top:20px}button{padding:8px 12px;border-radius:8px;color:#eaf2f4;background:#274453;border:1px solid #476373;cursor:pointer}button:hover{background:#376071}@media(max-width:720px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}td,th{padding:11px 9px}header{padding:24px 20px}}@media(max-width:420px){.cards{grid-template-columns:1fr 1fr}.value{font-size:27px}}
+-  </style>
++  
++.grid2{display:grid;grid-template-columns:minmax(0,620px) minmax(0,1fr);gap:16px;padding:0 20px 20px}@media(max-width:900px){.grid2{grid-template-columns:1fr}}
++canvas{max-width:100%;background:#0d1a22;border:1px solid #2d414b;border-radius:10px;display:block}
++.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:0 20px 14px}input[type=range]{flex:1;min-width:180px}select{background:#192c36;color:#eaf2f4;border:1px solid #476373;border-radius:8px;padding:7px}
++.legend{display:flex;gap:12px;font-size:12px;color:#a1b7c0;flex-wrap:wrap}.sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-2px}
++.lab{padding:3px 7px;border-radius:6px;font-size:11px;font-weight:700}.lab.c{background:#4e2a2e;color:#ffaaa4}.lab.i{background:#24473a;color:#8ee0bd}.lab.n{background:#2a3b44;color:#a1b7c0}
++.act{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.act select{padding:4px}.act button{padding:4px 8px;font-size:12px}
++.msg{padding:0 20px 14px;font-size:12px;color:#ffd28a;min-height:18px}
++.sel{background:#1c3340}
++</style>
+ </head>
+ <body>
+ <header>
+@@ -15,27 +24,80 @@
+  <div class="status"><div class="pill"><span class="dot" id="mqtt-dot"></span><span id="broker">Conectando al broker...</span></div><div class="pill" id="sync">Sincronizando datos...</div><div class="pill" id="edge">Esperando estado del gateway…</div></div>
+ </header>
+ <main class="page">
+- <div class="cards"><div class="card"><span>Total de alarmas</span><strong class="value" id="total">—</strong></div><div class="card"><span>Avisos ambientales</span><strong class="value high" id="environmental">—</strong></div><div class="card"><span>Incidentes sospechosos agrupados</span><strong class="value high" id="incidents-count">—</strong></div><div class="card"><span>SOS críticos</span><strong class="value critical" id="sos">—</strong></div><div class="card"><span>Última recepción</span><strong class="value" id="last" style="font-size:19px">—</strong></div></div>
++ <div class="cards"><div class="card"><span>Total de alarmas</span><strong class="value" id="total">—</strong></div><div class="card"><span>Incidentes agrupados</span><strong class="value high" id="incidents-count">—</strong></div><div class="card"><span>SOS críticos</span><strong class="value critical" id="sos">—</strong></div><div class="card"><span>Lecturas en ventana</span><strong class="value" id="readings-count">—</strong></div><div class="card"><span>Modelo activo</span><strong class="value" id="model-active" style="font-size:18px">—</strong></div><div class="card"><span>Última recepción</span><strong class="value" id="last" style="font-size:19px">—</strong></div></div>
+  <p id="analysis" aria-live="polite"></p>
+- <section class="section" style="margin-bottom:22px"><div class="sectionhead"><div><h2>Incidentes agrupados</h2><div class="hint">Agrupación experimental de sospechas por ejecución, cercanía espacial y ventana de 30 minutos. No equivale a incendios reales.</div></div></div><div class="tablewrap"><table><thead><tr><th>Primera señal</th><th>Última señal</th><th>Ejecución</th><th>Nodos</th><th>Avisos vinculados</th><th>Primer sensor</th></tr></thead><tbody id="incident-rows"></tbody></table><div id="incidents-empty" style="padding:16px;color:#9bb0b9">Sin sospechas corroboradas agrupables.</div></div></section>
++
++ <section class="section" style="margin-bottom:22px"><div class="sectionhead"><div><h2>Propagación del incendio</h2><div class="hint">Cada celda es un nodo de la rejilla 32×32. El color indica el orden en que alarmó; el fondo, el PM2,5 máximo de su zona.</div></div></div>
++  <div class="controls"><label for="inc-select">Incidente</label><select id="inc-select"></select><button id="play" type="button">▶ Reproducir</button><input id="slider" type="range" min="0" max="0" value="0" step="1" aria-label="Tiempo desde el primer nodo"><span id="tlabel" class="hint">—</span></div>
++  <div class="grid2"><div><canvas id="map" width="576" height="576" role="img" aria-label="Mapa de propagación por nodo"></canvas><div class="legend" style="margin-top:8px"><span><i class="sw" style="background:#ffe08a"></i>primeros</span><span><i class="sw" style="background:#ff7a3d"></i>intermedios</span><span><i class="sw" style="background:#c0152b"></i>últimos</span><span><i class="sw" style="background:#fff;outline:2px solid #4fd4a6"></i>origen</span><span id="hover" class="hint"></span></div></div>
++  <div><h2 style="font-size:15px;margin-bottom:8px">PM2,5 de los primeros nodos</h2><canvas id="chart" width="460" height="260" role="img" aria-label="PM2,5 de los primeros nodos del incidente"></canvas><div id="chart-note" class="hint" style="margin-top:6px"></div></div></div>
++ </section>
++
++ <section class="section" style="margin-bottom:22px"><div class="sectionhead"><div><h2>Incidentes y etiquetas</h2><div class="hint">Marca una alarma como correcta o falsa. Esa etiqueta verificada alimenta el reentrenamiento. Una etiqueta manual prevalece sobre la del escenario.</div></div></div><div class="msg" id="label-msg"></div><div class="tablewrap"><table><thead><tr><th>Primera señal</th><th>Duración</th><th>Nodos</th><th>Origen</th><th>Pico PM2,5</th><th>Etiqueta</th><th>Marcar</th></tr></thead><tbody id="incident-rows"></tbody></table><div id="incidents-empty" style="padding:16px;color:#9bb0b9">Sin sospechas corroboradas agrupables.</div></div></section>
++
++ <section class="section" style="margin-bottom:22px"><div class="sectionhead"><div><h2>Modelo y reentrenamiento</h2><div class="hint" id="retrain-hint">—</div></div><div class="act"><button id="retrain" type="button">Reentrenar ahora</button><button id="rollback" type="button">Volver al modelo anterior</button></div></div><div class="msg" id="model-msg"></div><div class="tablewrap"><table><thead><tr><th>Versión</th><th>Estado</th><th>Puerta sintética</th><th>Creado</th><th></th></tr></thead><tbody id="model-rows"></tbody></table></div></section>
++
+  <section class="section"><div class="sectionhead"><div><h2>Historial de avisos</h2><div class="hint">Las más recientes primero · actualización cada 2 segundos</div></div><button id="refresh" type="button">Actualizar</button></div><div class="tablewrap"><table><thead><tr><th>Recibida</th><th>Tipo</th><th>Decisión</th><th>Sensor</th><th>Prioridad</th><th>Proceso Edge</th></tr></thead><tbody id="rows"></tbody></table><div id="empty">Todavía no se han recibido alarmas oficiales.</div></div></section>
+- <footer>Este panel es un receptor central local dentro de Docker, no un servicio Cloud desplegado en Internet. Los SOS y las alertas sintéticas de prueba pueden contener <code>test_only: true</code>. No es un sistema operativo de emergencias ni valida incendios reales.</footer>
++ <footer>Receptor central local dentro de Docker, no un servicio Cloud desplegado en Internet. Datos sintéticos; las pruebas pueden contener <code>test_only: true</code>. No valida incendios reales.</footer>
+ </main>
+ <script>
+ const byId=id=>document.getElementById(id);
++const GRID=32,CELL=18;
++let incidents=[],nodes={},zones={},current=null,timer=null,sliderBusy=false;
+ function dateText(s){if(!s)return '—';const d=new Date(s);return isNaN(d.getTime())?s:d.toLocaleString('es-ES',{hour12:false});}
+ function field(parent,name,text){const td=document.createElement('td');td.className=name||'';td.textContent=text;parent.appendChild(td);return td;}
+-async function refresh(){try{const [s,a,i]=await Promise.all([fetch('/api/stats',{cache:'no-store'}),fetch('/api/alerts?limit=100',{cache:'no-store'}),fetch('/api/incidents?limit=40',{cache:'no-store'})]);if(!s.ok||!a.ok||!i.ok)throw new Error('respuesta HTTP');const stats=await s.json(),data=await a.json(),incidents=await i.json();const e=stats.edge;
+- if(e){
+-   const age=Date.now()-Date.parse(e.generated_at);
+-   byId('edge').textContent=(age>8000?'Último estado · ':'')+e.nodes+' sensores · '+e.readings+' lecturas · p95 Edge '+(e.processing_p95_ms??'—')+' ms';
+- }
+- byId('incidents-count').textContent=incidents.total_incidents;
+- const ir=byId('incident-rows');ir.replaceChildren();byId('incidents-empty').hidden=incidents.incidents.length>0;
+- for(const incident of incidents.incidents){const tr=document.createElement('tr');field(tr,'muted',dateText(incident.first_seen));field(tr,'muted',dateText(incident.last_seen));field(tr,'',incident.run_id);field(tr,'',incident.node_count);field(tr,'',incident.alert_count);field(tr,'',incident.first_node);ir.appendChild(tr);}
+- const w=stats.last_summary;byId('analysis').textContent=w?'Último resumen · calculado en '+w.computed_by+' · PM2,5 media '+w.mean_pm25+' µg/m³ · '+w.n+' muestras':'';byId('total').textContent=stats.total_alerts;byId('environmental').textContent=stats.environmental_alerts;byId('sos').textContent=stats.sos_alerts;byId('last').textContent=dateText(stats.last_received_at);byId('mqtt-dot').classList.toggle('ok',!!stats.mqtt_connected);byId('broker').textContent=stats.mqtt_connected?'MQTT conectado':'MQTT desconectado · reintentando';byId('sync').textContent='Datos actualizados: '+new Date().toLocaleTimeString('es-ES');const tbody=byId('rows');tbody.replaceChildren();byId('empty').hidden=data.alerts.length>0;for(const item of data.alerts){const tr=document.createElement('tr');field(tr,'muted',dateText(item.received_at));const t=field(tr,'',(item.alert_type==='sos_alert'?'SOS CRÍTICO':'AMBIENTAL')+(item.payload&&item.payload.test_only?' · TEST':''));t.className=item.alert_type==='sos_alert'?'tag sos':'tag env';field(tr,'',({environmental_risk:'Preaviso local',suspected_fire:'Sospecha con vecino',sos_alert:'Botón SOS'})[item.payload.decision]||'—');field(tr,'',item.node_id);field(tr,'',item.priority);field(tr,'muted',item.edge_processing_ms===null?'—':item.edge_processing_ms+' ms');tbody.appendChild(tr);}}
+-catch(e){byId('sync').textContent='Error al actualizar · reintentando';}}
+-byId('refresh').addEventListener('click',refresh);refresh();setInterval(refresh,2000);
++function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}
++async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j;}
++function nodeXY(id){const n=nodes[id];if(n)return[n.x,n.y];const m=/^node_(\d+)$/.exec(id);if(!m)return null;const i=+m[1]-1;return[i%GRID,Math.floor(i/GRID)];}
++function ramp(f){const c=f<.5?[[255,224,138],[255,122,61],f*2]:[[255,122,61],[192,21,43],(f-.5)*2];const a=c[0],b=c[1],t=c[2];return 'rgb('+a.map((v,k)=>Math.round(v+(b[k]-v)*t)).join(',')+')';}
++function heat(pm){if(pm==null)return '#0d1a22';const f=Math.max(0,Math.min(1,pm/150));return 'rgba(79,212,166,'+(0.05+0.35*f).toFixed(2)+')';}
++function drawMap(){const c=byId('map'),g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);
++ for(let y=0;y<GRID;y++)for(let x=0;x<GRID;x++){const id='node_'+String(y*GRID+x+1).padStart(4,'0');const z=nodes[id]&&nodes[id].zone;g.fillStyle='#0d1a22';g.fillRect(x*CELL,y*CELL,CELL,CELL);g.fillStyle=heat(z&&zones[z]?zones[z].max_pm25:null);g.fillRect(x*CELL,y*CELL,CELL,CELL);g.strokeStyle='#14232d';g.strokeRect(x*CELL+.5,y*CELL+.5,CELL-1,CELL-1);}
++ if(!current)return;const t=+byId('slider').value,tl=current.timeline,n=tl.length;let on=0;
++ tl.forEach((s,i)=>{if(s.offset_s>t)return;on++;const p=nodeXY(s.node);if(!p)return;g.fillStyle=ramp(n>1?i/(n-1):0);g.fillRect(p[0]*CELL+1,p[1]*CELL+1,CELL-2,CELL-2);if(i===0){g.strokeStyle='#4fd4a6';g.lineWidth=3;g.strokeRect(p[0]*CELL+2,p[1]*CELL+2,CELL-4,CELL-4);g.lineWidth=1;}});
++ byId('tlabel').textContent='t = +'+Math.round(t/60*10)/10+' min · '+on+' de '+n+' nodos en alarma';}
++async function drawChart(){const c=byId('chart'),g=c.getContext('2d');g.clearRect(0,0,c.width,c.height);const note=byId('chart-note');
++ if(!current){note.textContent='';return;}
++ const first=Date.parse(current.first_seen),last=Date.parse(current.last_seen),pad=600000;
++ const picks=current.timeline.slice(0,4);let series=[];
++ try{for(const s of picks){const d=await api('/api/readings?run_id='+encodeURIComponent(current.run_id)+'&node_id='+s.node+'&since='+(first-pad)+'&until='+(last+pad)+'&limit=1000');series.push({node:s.node,pts:d.readings.filter(r=>r.pm25!=null).reverse()});}}catch(e){series=[];}
++ const all=series.flatMap(s=>s.pts);if(!all.length){g.fillStyle='#9bb0b9';g.font='13px system-ui';g.fillText('Sin lecturas guardadas para este incidente',20,130);note.textContent='La evidencia llega solo en incidentes (topic edge/evidence).';return;}
++ const t0=Math.min(...all.map(r=>r.ts_ms)),t1=Math.max(...all.map(r=>r.ts_ms)),ymax=Math.max(40,...all.map(r=>r.pm25))*1.1,L=44,B=24,W=c.width-L-10,H=c.height-B-10;
++ g.strokeStyle='#2d414b';g.fillStyle='#9bb0b9';g.font='11px system-ui';for(let k=0;k<=4;k++){const y=10+H-H*k/4;g.beginPath();g.moveTo(L,y);g.lineTo(L+W,y);g.stroke();g.fillText(Math.round(ymax*k/4),6,y+4);}
++ const y35=10+H-H*35.5/ymax;if(y35>10){g.strokeStyle='#d9aa5e';g.setLineDash([4,4]);g.beginPath();g.moveTo(L,y35);g.lineTo(L+W,y35);g.stroke();g.setLineDash([]);g.fillStyle='#d9aa5e';g.fillText('35,5',L+W-30,y35-3);}
++ const colors=['#ffe08a','#ff7a3d','#c0152b','#8cb7ac'];series.forEach((s,i)=>{g.strokeStyle=colors[i];g.lineWidth=2;g.beginPath();s.pts.forEach((r,k)=>{const x=L+W*(r.ts_ms-t0)/Math.max(1,t1-t0),y=10+H-H*r.pm25/ymax;k?g.lineTo(x,y):g.moveTo(x,y);});g.stroke();g.fillStyle=colors[i];g.fillText(s.node.slice(5),L+8+i*50,c.height-8);});g.lineWidth=1;
++ note.textContent='PM2,5 (µg/m³) de los '+series.length+' primeros nodos; línea discontinua = 35,5 µg/m³ (referencia experimental).';}
++function select(inc){current=inc;const s=byId('slider');const max=inc?Math.ceil(inc.timeline[inc.timeline.length-1].offset_s):0;s.max=max;s.step=Math.max(1,Math.round(max/200));s.value=max;drawMap();drawChart();}
++function renderSelect(){const sel=byId('inc-select');const prev=current&&current.incident_id;sel.replaceChildren();incidents.forEach(i=>{const o=el('option',i.first_node+' · '+dateText(i.first_seen)+' · '+i.node_count+' nodos');o.value=i.incident_id;sel.appendChild(o);});
++ const keep=incidents.find(i=>i.incident_id===prev)||incidents[0]||null;if(keep){sel.value=keep.incident_id;if(!current||current.incident_id!==keep.incident_id)select(keep);else{current=keep;drawMap();}}else select(null);}
++function labelCell(tr,l){const td=el('td');if(!l){td.appendChild(el('span','sin etiqueta','lab n'));}else{td.appendChild(el('span',(l.label==='correct'?'CORRECTA · ':'FALSA · ')+l.true_class+' ('+(l.source==='manual'?'manual':'escenario')+')','lab '+(l.label==='correct'?'c':'i')));}tr.appendChild(td);}
++function actCell(tr,inc){const td=el('td'),box=el('div',undefined,'act');const sel=el('select');['normal','dust','fog','direct_sun','slow_fire','fast_fire'].forEach(v=>{const o=el('option',({normal:'ruido/otro',dust:'polvo',fog:'niebla',direct_sun:'sol directo',slow_fire:'fuego lento',fast_fire:'fuego rápido'})[v]);o.value=v;sel.appendChild(o);});
++ const b=el('button','Guardar');b.type='button';b.addEventListener('click',async()=>{const cls=sel.value,fire=cls.endsWith('_fire');try{await api('/api/labels',{incident_id:inc.incident_id,label:fire?'correct':'incorrect',true_class:cls});byId('label-msg').textContent='';await refresh();}catch(e){byId('label-msg').textContent='No se pudo guardar: '+e.message;}});box.append(sel,b);td.appendChild(box);tr.appendChild(td);}
++function renderIncidents(){const ir=byId('incident-rows');ir.replaceChildren();byId('incidents-empty').hidden=incidents.length>0;
++ for(const inc of incidents){const tr=document.createElement('tr');if(current&&inc.incident_id===current.incident_id)tr.className='sel';tr.style.cursor='pointer';tr.addEventListener('click',e=>{if(e.target.closest('.act'))return;byId('inc-select').value=inc.incident_id;select(inc);renderIncidents();});
++  field(tr,'muted',dateText(inc.first_seen));field(tr,'',Math.round(inc.duration_s/60*10)/10+' min');field(tr,'',inc.node_count);field(tr,'',inc.first_node);field(tr,'',inc.peak_pm25==null?'—':Math.round(inc.peak_pm25*10)/10);labelCell(tr,inc.label);actCell(tr,inc);ir.appendChild(tr);}}
++function renderModels(m){const rows=byId('model-rows');rows.replaceChildren();const act=m.models.find(x=>x.status==='active');byId('model-active').textContent=act?act.version:'—';
++ byId('retrain-hint').textContent='Etiquetas nuevas: '+m.pending_labels+' de '+m.trigger_labels+' para el reentrenamiento automático'+(m.running?' · entrenando…':'');byId('retrain').disabled=m.running;
++ for(const x of m.models){const tr=document.createElement('tr');field(tr,'',x.version);field(tr,'',({active:'ACTIVO',candidate:'candidato aprobado',previous:'anterior',rejected:'rechazado'})[x.status]||x.status);
++  const met=x.metrics;field(tr,'muted',met?((met.approved?'aprobado':'rechazado')+(met.reasons&&met.reasons.length?' · '+met.reasons.join(', '):'')):'—');field(tr,'muted',dateText(x.created_at));
++  const td=el('td');if(x.status==='candidate'){const b=el('button','Promover');b.type='button';b.addEventListener('click',async()=>{try{await api('/api/models/promote',{version:x.version});byId('model-msg').textContent='';await refresh();}catch(e){byId('model-msg').textContent='No se pudo promover: '+e.message;}});td.appendChild(b);}tr.appendChild(td);rows.appendChild(tr);}}
++async function refresh(){try{const [stats,data,inc]=await Promise.all([api('/api/stats'),api('/api/alerts?limit=100'),api('/api/incidents?limit=40')]);const e=stats.edge;
++ if(e){const age=Date.now()-Date.parse(e.generated_at);byId('edge').textContent=(age>8000?'Último estado · ':'')+e.nodes+' sensores · '+e.readings+' lecturas · p95 Edge '+(e.processing_p95_ms??'—')+' ms';}
++ incidents=inc.incidents.filter(i=>i.timeline&&i.timeline.length);byId('incidents-count').textContent=inc.total_incidents;renderSelect();renderIncidents();
++ const w=stats.last_summary;byId('analysis').textContent=w?'Último resumen · '+(w.zone?'zona '+w.zone+' · ':'')+'calculado en '+w.computed_by+' · PM2,5 media '+w.mean_pm25+' µg/m³ · '+w.n+' muestras':'';
++ byId('total').textContent=stats.total_alerts;byId('sos').textContent=stats.sos_alerts;byId('readings-count').textContent=stats.stored_readings??0;byId('last').textContent=dateText(stats.last_received_at);byId('mqtt-dot').classList.toggle('ok',!!stats.mqtt_connected);byId('broker').textContent=stats.mqtt_connected?'MQTT conectado':'MQTT desconectado · reintentando';byId('sync').textContent='Datos actualizados: '+new Date().toLocaleTimeString('es-ES');
++ const tbody=byId('rows');tbody.replaceChildren();byId('empty').hidden=data.alerts.length>0;for(const item of data.alerts){const tr=document.createElement('tr');field(tr,'muted',dateText(item.received_at));const t=field(tr,'',(item.alert_type==='sos_alert'?'SOS CRÍTICO':'AMBIENTAL')+(item.payload&&item.payload.test_only?' · TEST':''));t.className=item.alert_type==='sos_alert'?'tag sos':'tag env';field(tr,'',({environmental_risk:'Preaviso local',suspected_fire:'Sospecha con vecino',sos_alert:'Botón SOS'})[item.payload.decision]||'—');field(tr,'',item.node_id);field(tr,'',item.priority);field(tr,'muted',item.edge_processing_ms===null?'—':item.edge_processing_ms+' ms');tbody.appendChild(tr);}
++ try{renderModels(await api('/api/models'));}catch(e){byId('retrain-hint').textContent='Reentrenamiento no activo en este despliegue';}
++ try{const z=await api('/api/zones');zones={};(z.zones||z).forEach(x=>zones[x.zone]=x);}catch(e){}
++ }catch(e){byId('sync').textContent='Error al actualizar · reintentando';}}
++async function init(){try{const n=await api('/api/nodes');(n.nodes||n).forEach(x=>nodes[x.node_id]=x);}catch(e){}drawMap();refresh();setInterval(refresh,2000);}
++byId('refresh').addEventListener('click',refresh);
++byId('inc-select').addEventListener('change',e=>{select(incidents.find(i=>i.incident_id===e.target.value)||null);renderIncidents();});
++byId('slider').addEventListener('input',drawMap);
++byId('play').addEventListener('click',()=>{const s=byId('slider'),b=byId('play');if(timer){clearInterval(timer);timer=null;b.textContent='▶ Reproducir';return;}if(+s.value>=+s.max)s.value=0;b.textContent='⏸ Pausa';timer=setInterval(()=>{const next=+s.value+Math.max(1,+s.step)*2;if(next>=+s.max){s.value=s.max;clearInterval(timer);timer=null;b.textContent='▶ Reproducir';}else s.value=next;drawMap();},60);});
++byId('retrain').addEventListener('click',async()=>{try{await api('/api/retrain',{});byId('model-msg').textContent='Reentrenando…';refresh();}catch(e){byId('model-msg').textContent=e.message;}});
++byId('rollback').addEventListener('click',async()=>{try{await api('/api/models/rollback',{});byId('model-msg').textContent='';refresh();}catch(e){byId('model-msg').textContent='No se pudo volver atrás: '+e.message;}});
++init();
+ </script>
+ </body>
+ </html>
+diff --git a/demos/edge1000-v4/cloud/incidents.py b/demos/edge1000-v4/cloud/incidents.py
+index 0fe1611..c1cd551 100644
+--- a/demos/edge1000-v4/cloud/incidents.py
++++ b/demos/edge1000-v4/cloud/incidents.py
+@@ -130,9 +130,23 @@ def group_suspected_fire(events, gap_s=MAX_NEIGHBOUR_GAP_S):
+             and not isinstance(e.get("fire_score"), bool)
+             and math.isfinite(e["fire_score"])
+         ]
++        first_ts = {}
++        for e in ordered:
++            first_ts.setdefault(e["node_id"], e["_ts"])
++        origin_ts = ordered[0]["_ts"]
++        timeline = [
++            dict(
++                node=n,
++                first_alarm=datetime.fromtimestamp(t, timezone.utc).isoformat(),
++                offset_s=round(t - origin_ts, 1),
++            )
++            for n, t in sorted(first_ts.items(), key=lambda kv: (kv[1], kv[0]))
++        ]
+         result.append(
+             dict(
+                 incident_id=incident_id,
++                timeline=timeline,
++                duration_s=round(ordered[-1]["_ts"] - origin_ts, 1),
+                 run_id=run,
+                 first_seen=datetime.fromtimestamp(ordered[0]["_ts"], timezone.utc).isoformat(),
+                 last_seen=datetime.fromtimestamp(ordered[-1]["_ts"], timezone.utc).isoformat(),
+diff --git a/demos/edge1000-v4/cloud/labels.py b/demos/edge1000-v4/cloud/labels.py
+new file mode 100644
+index 0000000..c582d49
+--- /dev/null
++++ b/demos/edge1000-v4/cloud/labels.py
+@@ -0,0 +1,155 @@
++"""Verified labels for incidents and export for retraining (lab/train.py --extra).
++
++Only two sources are accepted: the scenario truth and a manual correction.
++Edge output is never a label. Manual labels override scenario labels.
++"""
++
++from __future__ import annotations
++
++import json
++from datetime import datetime, timezone
++
++from . import readings as rd
++
++FIRE_CLASSES = ("slow_fire", "fast_fire")
++NON_FIRE_CLASSES = ("normal", "dust", "fog", "direct_sun")
++BASE_MS = 1784073600000  # 2026-07-15T00:00:00Z, clock of the scenario files
++PRE_MS = 600_000  # clean "normal" context kept this long before the first alarm
++MARGIN_MS = 120_000
++SCENARIO_CLASS = {
++    "fuego_lento": ("correct", "slow_fire"),
++    "fuego_rapido": ("correct", "fast_fire"),
++    "polvo_tractor": ("incorrect", "dust"),
++    "niebla": ("incorrect", "fog"),
++    "sol_directo": ("incorrect", "direct_sun"),
++}
++
++
++def _now():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def check_label(label, true_class):
++    if label == "correct":
++        return true_class if true_class in FIRE_CLASSES else None
++    if label == "incorrect":
++        return true_class or "normal" if (true_class or "normal") in NON_FIRE_CLASSES else None
++    return None
++
++
++def set_label(conn, incident_id, label, true_class, source):
++    cls = check_label(label, true_class)
++    if (
++        cls is None
++        or source not in ("scenario", "manual")
++        or not isinstance(incident_id, str)
++        or not 0 < len(incident_id) <= 64
++    ):
++        raise ValueError("invalid label")
++    conn.execute(
++        "INSERT OR REPLACE INTO labels(incident_id,label,true_class,source,created_at) "
++        "VALUES (?,?,?,?,?)",
++        (incident_id, label, cls, source, _now()),
++    )
++    return cls
++
++
++def effective(conn):
++    """incident_id -> (label, class, source); manual wins over scenario."""
++    out = {}
++    for row in conn.execute(
++        "SELECT incident_id,label,true_class,source FROM labels "
++        "ORDER BY CASE source WHEN 'scenario' THEN 0 ELSE 1 END"
++    ):
++        out[row["incident_id"]] = (row["label"], row["true_class"], row["source"])
++    return out
++
++
++def save_truth(conn, run_id, truth):
++    if not isinstance(run_id, str) or not 0 < len(run_id) <= 128:
++        raise ValueError("run_id")
++    if not isinstance(truth, dict) or truth.get("escenario") not in SCENARIO_CLASS and (
++        truth.get("alarma_esperada") is not False
++    ):
++        raise ValueError("unsupported scenario truth")
++    conn.execute(
++        "INSERT OR REPLACE INTO truth(run_id,payload_json) VALUES (?,?)",
++        (run_id, json.dumps(truth, sort_keys=True)),
++    )
++
++
++def label_from_truth(conn, incidents):
++    """Label every incident of runs with stored truth. Returns number labelled."""
++    done = 0
++    for item in incidents:
++        row = conn.execute(
++            "SELECT payload_json FROM truth WHERE run_id=?", (item["run_id"],)
++        ).fetchone()
++        if row is None:
++            continue
++        truth = json.loads(row["payload_json"])
++        name = truth.get("escenario")
++        t0_ms = BASE_MS + int(truth.get("t0_s", 0)) * 1000
++        first_ms = rd._ts_ms(item["first_seen"])
++        if truth.get("alarma_esperada") and name in SCENARIO_CLASS and first_ms >= t0_ms:
++            label, cls = SCENARIO_CLASS[name]
++        else:  # alarm without fire (dust, fog, sun, or before the fire started)
++            label, cls = "incorrect", SCENARIO_CLASS.get(name, ("", "normal"))[1]
++            if cls in FIRE_CLASSES:
++                cls = "normal"
++        set_label(conn, item["incident_id"], label, cls, "scenario")
++        done += 1
++    return done
++
++
++def training_rows(conn, incidents):
++    """Yield one reviewed-train record per labelled reading.
++
++    Fire/other class applies from each node's first alarm (minus a small margin
++    for non-fire) to its last alarm + margin. Readings more than PRE_MS before
++    the first alarm are clean 'normal' context; the gap in between is skipped
++    because it is ambiguous. Message format is the Edge's schema v1.
++    """
++    labels = effective(conn)
++    for item in incidents:
++        if item["incident_id"] not in labels:
++            continue
++        label, cls, _ = labels[item["incident_id"]]
++        run = item["run_id"]
++        last_ms = rd._ts_ms(item["last_seen"])
++        for step in item["timeline"]:
++            first = rd._ts_ms(step["first_alarm"])
++            lo = first if label == "correct" else first - MARGIN_MS
++            for r in conn.execute(
++                "SELECT * FROM readings WHERE run_id=? AND node_id=? ORDER BY ts_ms, seq",
++                (run, step["node"]),
++            ):
++                t = r["ts_ms"]
++                if lo <= t <= last_ms + MARGIN_MS:
++                    klass = cls
++                elif t < first - PRE_MS:
++                    klass = "normal"
++                else:
++                    continue
++                yield {
++                    "group": f"reviewed-train-{run}",
++                    "class": klass,
++                    "message": {
++                        "schema_version": 1,
++                        "type": "reading",
++                        "run_id": run,
++                        "node_id": r["node_id"],
++                        "seq": r["seq"],
++                        "timestamp": datetime.fromtimestamp(
++                            t / 1000, timezone.utc
++                        ).isoformat(),
++                        "timebase": "simulated",
++                        "boot_id": r["boot_id"],
++                        "measurements": {
++                            "pm25_ug_m3": r["pm25"],
++                            "pm10_ug_m3": r["pm10"],
++                            "air_temperature_c": r["temperature"],
++                            "relative_humidity_pct": r["humidity"],
++                        },
++                    },
++                }
+diff --git a/demos/edge1000-v4/cloud/readings.py b/demos/edge1000-v4/cloud/readings.py
+new file mode 100644
+index 0000000..51bbd21
+--- /dev/null
++++ b/demos/edge1000-v4/cloud/readings.py
+@@ -0,0 +1,254 @@
++"""Reading batches from the Edge: sliding-window store plus Cloud-side tables.
++
++Alerts stay the immutable event log. Readings are a bounded window used for the
++panel, incident peaks and (with labels) retraining. Dedup key: (run, node, boot, seq).
++"""
++
++from __future__ import annotations
++
++import json
++import math
++from datetime import datetime, timezone
++
++READINGS_TOPIC = "wildfiresense/edge/evidence"
++MAX_BATCH_BYTES = 1 << 20
++MAX_BATCH_READINGS = 5000
++WINDOW_S = 6 * 3600
++FIELDS = ("PM2.5", "PM10", "temperature", "humidity")
++
++SCHEMA = (
++    """CREATE TABLE IF NOT EXISTS readings (
++        run_id TEXT NOT NULL,
++        node_id TEXT NOT NULL,
++        boot_id TEXT NOT NULL,
++        seq INTEGER NOT NULL,
++        ts_ms INTEGER NOT NULL,
++        kind TEXT NOT NULL,
++        pm25 REAL, pm10 REAL, temperature REAL, humidity REAL,
++        batch_id TEXT NOT NULL,
++        PRIMARY KEY (run_id, node_id, boot_id, seq)
++    )""",
++    "CREATE INDEX IF NOT EXISTS idx_readings_time ON readings(run_id, ts_ms)",
++    "CREATE INDEX IF NOT EXISTS idx_readings_node ON readings(run_id, node_id, ts_ms)",
++    """CREATE TABLE IF NOT EXISTS labels (
++        incident_id TEXT NOT NULL,
++        label TEXT NOT NULL CHECK (label IN ('correct', 'incorrect')),
++        true_class TEXT,
++        source TEXT NOT NULL CHECK (source IN ('scenario', 'manual')),
++        created_at TEXT NOT NULL,
++        PRIMARY KEY (incident_id, source)
++    )""",
++    """CREATE TABLE IF NOT EXISTS nodes (
++        node_id TEXT PRIMARY KEY,
++        zone TEXT NOT NULL,
++        x INTEGER NOT NULL,
++        y INTEGER NOT NULL
++    )""",
++    """CREATE TABLE IF NOT EXISTS truth (
++        run_id TEXT PRIMARY KEY,
++        payload_json TEXT NOT NULL
++    )""",
++    """CREATE TABLE IF NOT EXISTS models (
++        version TEXT PRIMARY KEY,
++        status TEXT NOT NULL CHECK (status IN ('active', 'candidate', 'previous', 'rejected')),
++        metrics_json TEXT,
++        created_at TEXT NOT NULL
++    )""",
++    """CREATE TABLE IF NOT EXISTS retrain_runs (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        started_at TEXT NOT NULL,
++        finished_at TEXT,
++        trigger TEXT NOT NULL,
++        labels_used INTEGER,
++        result TEXT,
++        model_version TEXT
++    )""",
++)
++
++
++GRID_WIDTH = 32
++GRID_NODES = 1024
++ZONE_SIZE = 4
++
++
++def grid_position(node):
++    """node_0496 -> (zone, x, y) on the 32x32 grid, or None outside it."""
++    name = node_name(node)
++    if name is None or not 1 <= int(name[5:]) <= GRID_NODES:
++        return None
++    idx = int(name[5:]) - 1
++    x, y = idx % GRID_WIDTH, idx // GRID_WIDTH
++    return f"z_{y // ZONE_SIZE}_{x // ZONE_SIZE}", x, y
++
++
++def create_tables(conn):
++    for statement in SCHEMA:
++        conn.execute(statement)
++    if conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] != GRID_NODES:
++        for n in range(1, GRID_NODES + 1):
++            name = f"node_{n:04d}"
++            zone, x, y = grid_position(name)
++            conn.execute(
++                "INSERT OR IGNORE INTO nodes(node_id,zone,x,y) VALUES (?,?,?,?)",
++                (name, zone, x, y),
++            )
++
++
++def node_name(raw):
++    """Accepts 496, "496" or "node_0496"; returns "node_0496" or None."""
++    if isinstance(raw, bool):
++        return None
++    if isinstance(raw, str) and raw.startswith("node_"):
++        raw = raw[5:]
++    try:
++        num = int(raw)
++    except (TypeError, ValueError):
++        return None
++    return f"node_{num:04d}" if 1 <= num <= 9999 else None
++
++
++def _ts_ms(value):
++    if isinstance(value, bool):
++        return None
++    if isinstance(value, (int, float)):
++        return int(value) if math.isfinite(value) and value > 0 else None
++    if isinstance(value, str):
++        try:
++            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
++        except ValueError:
++            return None
++        if dt.tzinfo is None:
++            dt = dt.replace(tzinfo=timezone.utc)
++        return int(dt.timestamp() * 1000)
++    return None
++
++
++def _number(value):
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    return float(value) if math.isfinite(value) else None
++
++
++def parse_batch(payload):
++    """Returns (batch_id, run_id, rows) or raises ValueError on a malformed batch."""
++    if not isinstance(payload, bytes) or not 0 < len(payload) <= MAX_BATCH_BYTES:
++        raise ValueError("size")
++    try:
++        data = json.loads(payload.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError("json") from exc
++    if not isinstance(data, dict):
++        raise ValueError("shape")
++    batch_id = data.get("batch_id")
++    run_id = data.get("run_id", "default")
++    items = data.get("readings")
++    if (
++        not isinstance(batch_id, str)
++        or not 0 < len(batch_id) <= 128
++        or not isinstance(run_id, str)
++        or not 0 < len(run_id) <= 128
++        or not isinstance(items, list)
++        or len(items) > MAX_BATCH_READINGS
++    ):
++        raise ValueError("fields")
++    rows = []
++    for item in items:
++        if not isinstance(item, dict):
++            raise ValueError("reading")
++        node = node_name(item.get("id", item.get("node_id")))
++        ts = _ts_ms(item.get("ts"))
++        seq = item.get("seq")
++        boot = item.get("boot_id", "default")
++        values = item.get("values")
++        kind = item.get("kind", "periodic")
++        if (
++            node is None
++            or ts is None
++            or isinstance(seq, bool)
++            or not isinstance(seq, int)
++            or seq < 0
++            or not isinstance(boot, str)
++            or not 0 < len(boot) <= 64
++            or not isinstance(kind, str)
++            or not isinstance(values, dict)
++        ):
++            raise ValueError("reading")
++        numbers = [_number(values.get(f)) for f in FIELDS]
++        if all(n is None for n in numbers):
++            raise ValueError("reading")
++        rows.append((run_id, node, boot, seq, ts, kind[:32], *numbers, batch_id))
++    return batch_id, run_id, rows
++
++
++def ingest_batch(conn, payload, window_s=WINDOW_S):
++    """Returns (result, batch_id, inserted, duplicates).
++
++    result is inserted|duplicate|invalid. A repeated batch is a delivered
++    duplicate (safe to ACK); readings are deduplicated individually.
++    """
++    try:
++        batch_id, run_id, rows = parse_batch(payload)
++    except ValueError:
++        return "invalid", None, 0, 0
++    inserted = 0
++    for row in rows:
++        inserted += conn.execute(
++            """INSERT OR IGNORE INTO readings
++               (run_id,node_id,boot_id,seq,ts_ms,kind,pm25,pm10,temperature,humidity,batch_id)
++               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
++            row,
++        ).rowcount
++    if rows:
++        conn.execute(
++            "DELETE FROM readings WHERE run_id=? AND ts_ms < "
++            "(SELECT MAX(ts_ms) FROM readings WHERE run_id=?) - ?",
++            (run_id, run_id, int(window_s * 1000)),
++        )
++    duplicates = len(rows) - inserted
++    return ("inserted" if inserted or not rows else "duplicate"), batch_id, inserted, duplicates
++
++
++def query(conn, run_id=None, node_id=None, since_ms=None, until_ms=None, limit=500):
++    where, args = [], []
++    for column, value in (("run_id", run_id), ("node_id", node_id)):
++        if value is not None:
++            where.append(f"{column} = ?")
++            args.append(value)
++    if since_ms is not None:
++        where.append("ts_ms >= ?")
++        args.append(since_ms)
++    if until_ms is not None:
++        where.append("ts_ms <= ?")
++        args.append(until_ms)
++    sql = (
++        "SELECT run_id,node_id,boot_id,seq,ts_ms,kind,pm25,pm10,temperature,humidity "
++        "FROM readings"
++        + (" WHERE " + " AND ".join(where) if where else "")
++        + " ORDER BY ts_ms DESC LIMIT ?"
++    )
++    args.append(max(1, min(1000, int(limit))))
++    return [dict(r) for r in conn.execute(sql, args).fetchall()]
++
++
++def peak_pm25(conn, run_id, nodes, start_ms, end_ms):
++    if not nodes:
++        return None
++    marks = ",".join("?" for _ in nodes)
++    row = conn.execute(
++        f"SELECT MAX(pm25) FROM readings WHERE run_id=? AND node_id IN ({marks}) "
++        "AND ts_ms BETWEEN ? AND ?",
++        (run_id, *nodes, start_ms, end_ms),
++    ).fetchone()
++    return row[0] if row else None
++
++
++def counts(conn):
++    row = conn.execute(
++        "SELECT COUNT(*), COUNT(DISTINCT node_id), MIN(ts_ms), MAX(ts_ms) FROM readings"
++    ).fetchone()
++    return dict(
++        stored_readings=row[0],
++        reading_nodes=row[1],
++        window_from_ms=row[2],
++        window_to_ms=row[3],
++    )
+diff --git a/demos/edge1000-v4/cloud/retrain.py b/demos/edge1000-v4/cloud/retrain.py
+new file mode 100644
+index 0000000..c20633f
+--- /dev/null
++++ b/demos/edge1000-v4/cloud/retrain.py
+@@ -0,0 +1,208 @@
++"""Retraining on verified labels, synthetic gate, model registry and rollback.
++
++Trigger: N new labels since the last run. Candidates never go live on their own:
++promotion is explicit (button or API), and only for candidates that passed the gate.
++Rollback restores the previous registered version.
++"""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++import threading
++from datetime import datetime, timezone
++from pathlib import Path
++
++from edge.model import ROOT
++
++TRIGGER_LABELS = 10
++STATUSES = ("active", "candidate", "previous", "rejected")
++
++
++def _now():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def _subprocess_train(extra, output):
++    subprocess.run(
++        [sys.executable, "-m", "lab.train", "--output", str(output), "--extra", str(extra)],
++        cwd=ROOT, check=True, capture_output=True, timeout=3600,
++    )
++
++
++def _subprocess_gate(candidate, baseline, report):
++    # The gate exits non-zero when it rejects; the report is written either way.
++    subprocess.run(
++        [sys.executable, "-m", "lab.model_gate", "--candidate", str(candidate),
++         "--baseline", str(baseline), "--out", str(report)],
++        cwd=ROOT, capture_output=True, timeout=3600,
++    )
++    return json.loads(Path(report).read_text(encoding="utf-8"))
++
++
++def _scenario_check(candidate, baseline):
++    """The team's nine scenarios: the candidate must not regress against the deployed model."""
++    from lab.scenario_gate import DEFAULT_DIR, compare
++
++    if not DEFAULT_DIR.exists():
++        return dict(approved=True, skipped="scenarios_unavailable")
++    return compare(Path(candidate), Path(baseline))
++
++
++def _version(path):
++    return json.loads(Path(path).read_text(encoding="utf-8"))["version"]
++
++
++def _promote(candidate, target):
++    from lab.promote import promote
++
++    promote(Path(candidate), Path(target))
++
++
++class Retrainer:
++    def __init__(self, store, work_dir, model_path=None, trigger_labels=TRIGGER_LABELS,
++                 train_fn=_subprocess_train, gate_fn=_subprocess_gate, promote_fn=_promote,
++                 scenario_fn=_scenario_check):
++        self.store = store
++        self.work_dir = Path(work_dir)
++        self.work_dir.mkdir(parents=True, exist_ok=True)
++        self.model_path = Path(model_path or ROOT / "models/forest.json")
++        self.trigger_labels = trigger_labels
++        self.train_fn, self.gate_fn, self.promote_fn = train_fn, gate_fn, promote_fn
++        self.scenario_fn = scenario_fn
++        self.lock = threading.Lock()
++        with store.connect() as conn:
++            if conn.execute("SELECT COUNT(*) FROM models").fetchone()[0] == 0:
++                conn.execute(
++                    "INSERT INTO models(version,status,metrics_json,created_at) VALUES (?,?,?,?)",
++                    (_version(self.model_path), "active", None, _now()),
++                )
++
++    # --- state -----------------------------------------------------------
++    def pending_labels(self):
++        with self.store.connect() as conn:
++            last = conn.execute("SELECT MAX(started_at) FROM retrain_runs").fetchone()[0]
++            if last is None:
++                return conn.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
++            return conn.execute(
++                "SELECT COUNT(*) FROM labels WHERE created_at > ?", (last,)
++            ).fetchone()[0]
++
++    def state(self):
++        with self.store.connect() as conn:
++            models = [dict(r) for r in conn.execute(
++                "SELECT version,status,metrics_json,created_at FROM models ORDER BY created_at DESC")]
++            runs = [dict(r) for r in conn.execute(
++                "SELECT * FROM retrain_runs ORDER BY id DESC LIMIT 20")]
++        for m in models:
++            m["metrics"] = json.loads(m.pop("metrics_json") or "null")
++        return dict(models=models, runs=runs, pending_labels=self.pending_labels(),
++                    trigger_labels=self.trigger_labels, running=self.lock.locked())
++
++    # --- retraining ------------------------------------------------------
++    def maybe_trigger(self):
++        """Start a background run when enough new verified labels exist."""
++        if self.lock.locked() or self.pending_labels() < self.trigger_labels:
++            return False
++        threading.Thread(target=self.run, args=("labels",), daemon=True).start()
++        return True
++
++    def run(self, trigger="manual"):
++        if not self.lock.acquire(blocking=False):
++            return dict(result="busy")
++        try:
++            used = self.pending_labels()
++            with self.store.connect() as conn:
++                run_id = conn.execute(
++                    "INSERT INTO retrain_runs(started_at,trigger,labels_used) VALUES (?,?,?)",
++                    (_now(), trigger, used),
++                ).lastrowid
++            result, version = self._execute(run_id)
++            with self.store.connect() as conn:
++                conn.execute(
++                    "UPDATE retrain_runs SET finished_at=?,result=?,model_version=? WHERE id=?",
++                    (_now(), result, version, run_id),
++                )
++            return dict(result=result, model_version=version, run_id=run_id)
++        finally:
++            self.lock.release()
++
++    def _execute(self, run_id):
++        extra = self.work_dir / f"extra_{run_id}.jsonl"
++        if self.store.export_training(extra) == 0:
++            return "no_data", None
++        candidate = self.work_dir / f"candidate_{run_id}.json"
++        try:
++            self.train_fn(extra, candidate)
++            version = _version(candidate)
++            report = self.gate_fn(candidate, self.model_path, self.work_dir / f"gate_{run_id}.json")
++            scenarios = self.scenario_fn(candidate, self.model_path)
++        except Exception as exc:  # noqa: BLE001 - recorded, never fatal for the Cloud
++            return f"error: {type(exc).__name__}", None
++        final = self.work_dir / f"forest.{version}.json"
++        candidate.replace(final)
++        reasons = list(report.get("reasons") or [])
++        if not scenarios.get("approved"):
++            reasons += [f"scenario_regression:{n}" for n in scenarios.get("regressions", [])]
++        approved = (
++            bool(report.get("approved"))
++            and bool(scenarios.get("approved"))
++            and not report.get("same_version")
++        )
++        status = "candidate" if approved else "rejected"
++        passed = scenarios.get("candidate", {})
++        metrics = dict(approved=approved, reasons=reasons,
++                       scenarios=dict(passed=passed.get("passed"), total=passed.get("total"),
++                                      failed=passed.get("failed"), skipped=scenarios.get("skipped")),
++                       baseline=report.get("baseline_model"),
++                       candidate=report.get("candidate"), reference=report.get("baseline"))
++        with self.store.connect() as conn:
++            conn.execute(
++                "INSERT OR REPLACE INTO models(version,status,metrics_json,created_at) VALUES (?,?,?,?)",
++                (version, status, json.dumps(metrics), _now()),
++            )
++        return ("candidate" if approved else "rejected"), version
++
++    # --- promotion and rollback -------------------------------------------
++    def _active(self, conn):
++        row = conn.execute("SELECT version FROM models WHERE status='active'").fetchone()
++        return row[0] if row else None
++
++    def promote(self, version):
++        with self.store.connect() as conn:
++            row = conn.execute("SELECT status FROM models WHERE version=?", (version,)).fetchone()
++            if row is None or row[0] != "candidate":
++                raise ValueError("only gate-approved candidates can be promoted")
++            old = self._active(conn)
++        if old:
++            keep = self.work_dir / f"forest.{old}.json"
++            if not keep.exists() and self.model_path.exists():
++                keep.write_bytes(self.model_path.read_bytes())
++        self.promote_fn(self.work_dir / f"forest.{version}.json", self.model_path)
++        with self.store.connect() as conn:
++            conn.execute("UPDATE models SET status='candidate' WHERE status='previous'")
++            if old:
++                conn.execute("UPDATE models SET status='previous' WHERE version=?", (old,))
++            conn.execute("UPDATE models SET status='active' WHERE version=?", (version,))
++        return version
++
++    def rollback(self):
++        with self.store.connect() as conn:
++            prev = conn.execute(
++                "SELECT version FROM models WHERE status='previous' ORDER BY created_at DESC LIMIT 1"
++            ).fetchone()
++            current = self._active(conn)
++        if prev is None:
++            raise ValueError("no previous model to restore")
++        version = prev[0]
++        source = self.work_dir / f"forest.{version}.json"
++        if not source.exists():
++            source = self.model_path.with_name(f"forest.{version}.json")
++        if not source.exists():
++            raise ValueError("previous model file is missing")
++        self.promote_fn(source, self.model_path)
++        with self.store.connect() as conn:
++            conn.execute("UPDATE models SET status='candidate' WHERE version=?", (current,))
++            conn.execute("UPDATE models SET status='active' WHERE version=?", (version,))
++        return version
+diff --git a/demos/edge1000-v4/docs/CLOUD_CONTRATO_EDGE.md b/demos/edge1000-v4/docs/CLOUD_CONTRATO_EDGE.md
+new file mode 100644
+index 0000000..7317de6
+--- /dev/null
++++ b/demos/edge1000-v4/docs/CLOUD_CONTRATO_EDGE.md
+@@ -0,0 +1,41 @@
++# Contrato Edge -> Cloud (Cloud final)
++
++Todo es sintético. El Cloud no decide en tiempo real: guarda, agrupa incidentes, etiqueta, reentrena y valida.
++
++## Mensajes que el Cloud acepta (MQTT, QoS 1)
++| Topic | Contenido | ACK |
++|---|---|---|
++| `wildfiresense/edge/alerts` | Alertas (sin cambios) | `cloud/ack` `{"event_id"}` |
++| `wildfiresense/cloud/analysis` | Resumen por zona (ver abajo). El formato antiguo sin `zone` sigue válido | `cloud/ack` `{"event_id"}` |
++| `wildfiresense/edge/evidence` | Lecturas crudas de los nodos de un incidente (10 min antes y después) | `cloud/ack` `{"event_id": "<batch_id>"}` |
++| `wildfiresense/edge/status`, `edge/ping` | Sin cambios | `cloud/pong` |
++
++### Resumen por zona (`cloud/analysis`)
++Zona = bloque 4x4 de la rejilla 32x32: `z_{y//4}_{x//4}` con `idx = N-1`, `x = idx % 32`, `y = idx // 32`.
++```json
++{"event_id":"...","generated_at":"...","computed_by":"edge",
++ "zone":"z_3_3","from_ts":1784124000000,"to_ts":1784124060000,
++ "n":120,"mean_pm25":12.4,"max_pm25":48.0,"max_node_id":"node_0496"}
++```
++Con `computed_by:"cloud"` se envía `samples: [{"node_id":..,"pm25":..}]` (1..512) y el Cloud calcula.
++
++### Evidencia (`edge/evidence`)
++```json
++{"batch_id":"unico","run_id":"...","readings":[
++ {"id":496,"ts":1784124000000,"seq":12,"boot_id":"a3f1c2d4","kind":"periodic",
++  "values":{"PM2.5":9.4,"PM10":17.8,"temperature":24.1,"humidity":58.3}}]}
++```
++- `id`: entero o `node_0496`. `ts`: ms o ISO. Máximo 1 MiB y 5000 lecturas por mensaje.
++- Deduplicación por `(run_id, node, boot_id, seq)`; reenviar un lote es seguro.
++
++## API HTTP
++`GET /api/stats|alerts|incidents|readings|nodes|zones|models` · `POST /api/labels|truth|retrain|models/promote|models/rollback`.
++- `incidents` incluye `timeline` (orden y segundos de alarma por nodo), `duration_s`, `peak_pm25` y `label`.
++
++## Etiquetas y reentrenamiento
++- Fuentes de etiqueta: verdad del escenario (`POST /api/truth`) o corrección manual (`POST /api/labels`). Nunca la salida del Edge. La manual prevalece.
++- A las N etiquetas nuevas (por defecto 10, `RETRAIN_TRIGGER_LABELS`) se exporta el JSONL revisado, se ejecuta `lab.train --extra` y `lab.model_gate`.
++- Solo un candidato aprobado se puede promover. `rollback` restaura el modelo anterior.
++- El Edge debe recargar `models/forest.json` tras promover o volver atrás.
++- Además del gate sintético, el candidato debe pasar los 9 escenarios de `data/scenarios` (`lab/scenario_gate.py`): no puede fallar ninguno que el modelo desplegado supere.
++- Verificado de punta a punta: entrenamiento real con 42 039 filas exportadas por el Cloud en 29 s; el candidato fue rechazado por el gate (macro-F1, exactitud y retardo) y el modelo activo no cambió.
+diff --git a/demos/edge1000-v4/lab/scenario_gate.py b/demos/edge1000-v4/lab/scenario_gate.py
+new file mode 100644
+index 0000000..768ab89
+--- /dev/null
++++ b/demos/edge1000-v4/lab/scenario_gate.py
+@@ -0,0 +1,111 @@
++"""Run the Edge engine over the team's nine scenario files and check each *_verdad.json.
++
++External to the training generator: scenarios come from a different generator
++family (still synthetic). Used as an extra check for retrained candidates.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from edge.logic import Engine, READINGS, SOS
++from edge.model import Forest, ROOT
++
++BASE_MS = 1784073600000
++SCENARIOS = (
++    "fuego_lento", "fuego_rapido", "polvo_tractor", "niebla", "sol_directo",
++    "sos_boton", "fallo_congelado", "fallo_ruido", "fallo_silencio",
++)
++DEFAULT_DIR = ROOT / "data" / "scenarios"
++
++
++def _node(n):
++    return f"node_{n:04d}"
++
++
++def run_scenario(name, forest, directory=DEFAULT_DIR):
++    truth = json.loads((directory / f"{name}_verdad.json").read_text(encoding="utf-8"))
++    rows = [json.loads(line) for line in (directory / f"{name}.jsonl").open(encoding="utf-8")]
++    rows.sort(key=lambda r: (r["ts"], r["id"], r["seq"]))
++    engine, events, rejected = Engine(forest=forest), [], 0
++    for raw in rows:
++        topic = SOS if raw.get("kind") == "emergency" else READINGS + _node(raw["id"])
++        try:
++            _, out = engine.handle(topic, raw)
++        except ValueError:
++            rejected += 1
++            continue
++        events.extend(out)
++    t0 = BASE_MS / 1000 + truth["t0_s"]
++
++    def times(kind, node=None):
++        return sorted(
++            e["_t"] for e in events
++            if e["decision"] == kind and (node is None or e["node_id"] == _node(node))
++        )
++
++    for e in events:  # reading_timestamp -> epoch seconds
++        from datetime import datetime
++        e["_t"] = datetime.fromisoformat(e["reading_timestamp"]).timestamp()
++    fires, risks = times("suspected_fire"), times("environmental_risk")
++    result = dict(
++        scenario=name, messages=len(rows), rejected=rejected,
++        suspected_fire=len(fires), environmental_risk=len(risks), checks={},
++    )
++    if name.startswith("fuego"):
++        result["delay_s"] = round(fires[0] - t0, 1) if fires else None
++        result["checks"] = {
++            "fire_detected": bool(fires),
++            "no_alarm_before_start": not any(t < t0 for t in fires),
++        }
++    elif name == "sos_boton":
++        sos = times("sos_alert", truth["nodo_evento"])
++        result["delay_s"] = round(sos[0] - t0, 1) if sos else None
++        result["checks"] = {"sos_within_5s": bool(sos) and sos[0] - t0 <= 5,
++                            "no_fire_alarm": not fires}
++    elif name.startswith("fallo"):
++        health = [e for e in events if e["decision"] == "node_health"
++                  and e["node_id"] == _node(truth["nodo_evento"])]
++        want = truth["estado_esperado_nodo"]
++        result["checks"] = {
++            "node_flagged": any(e.get("health") == want for e in health)
++            or (want == "FALLO" and bool(health)),
++            "no_fire_alarm": not fires,
++        }
++    else:
++        result["checks"] = {"no_fire_alarm": not fires}
++    result["passed"] = all(result["checks"].values())
++    return result
++
++
++def run_all(model_path, directory=DEFAULT_DIR):
++    forest = Forest(model_path)
++    results = [run_scenario(n, forest, directory) for n in SCENARIOS]
++    return dict(
++        model=forest.version,
++        passed=sum(r["passed"] for r in results),
++        total=len(results),
++        failed=[r["scenario"] for r in results if not r["passed"]],
++        results=results,
++    )
++
++
++def compare(candidate, baseline, directory=DEFAULT_DIR):
++    """Candidate must not fail a scenario that the deployed model passes."""
++    new, old = run_all(candidate, directory), run_all(baseline, directory)
++    regressions = sorted(set(new["failed"]) - set(old["failed"]))
++    return dict(approved=not regressions, regressions=regressions, candidate=new, baseline=old)
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--model", type=Path, default=ROOT / "models/forest.json")
++    ap.add_argument("--dir", type=Path, default=DEFAULT_DIR)
++    args = ap.parse_args()
++    report = run_all(args.model, args.dir)
++    for r in report["results"]:
++        print(f'{r["scenario"]:16s} {"OK " if r["passed"] else "FAIL"} {r["checks"]} '
++              f'fire={r["suspected_fire"]} risk={r["environmental_risk"]} delay={r.get("delay_s")}')
++    print(f'{report["model"]}: {report["passed"]}/{report["total"]}')
+diff --git a/demos/edge1000-v4/tests/test_labels.py b/demos/edge1000-v4/tests/test_labels.py
+new file mode 100644
+index 0000000..befd71c
+--- /dev/null
++++ b/demos/edge1000-v4/tests/test_labels.py
+@@ -0,0 +1,143 @@
++"""Verified labels, scenario truth, training export, nodes and zone summaries."""
++
++import json
++import tempfile
++import threading
++import unittest
++from http.server import ThreadingHTTPServer
++from pathlib import Path
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
++
++from cloud.app import AlertStore, BrokerStatus, TOPIC, build_handler
++from cloud.labels import BASE_MS
++from cloud import readings as rd
++from lab.train import reviewed_history
++from tests.test_readings import alert, batch
++
++T0_S = 3600  # fire start, seconds since scenario clock origin
++ALARM_MIN = {"node_0496": 0, "node_0497": 4}
++
++
++def iso_minute(minute):
++    return f"2026-11-20T19:{minute:02d}:00+00:00"
++
++
++class LabelsTest(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.store = AlertStore(Path(self.temp.name) / "c.sqlite")
++        for ident, node, minute in (("a", "node_0496", 0), ("b", "node_0497", 4)):
++            self.store.ingest(TOPIC, alert(ident, node, minute))
++        self.incident = self.store.incidents()["incidents"][0]["incident_id"]
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def server(self):
++        srv = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(self.store, BrokerStatus()))
++        threading.Thread(target=srv.serve_forever, daemon=True).start()
++        self.addCleanup(srv.server_close)
++        self.addCleanup(srv.shutdown)
++        return f"http://127.0.0.1:{srv.server_port}"
++
++    def post(self, base, path, body):
++        req = Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
++        with urlopen(req) as r:
++            return json.load(r)
++
++    def test_manual_label_validation_and_override(self):
++        base = self.server()
++        for bad in (
++            {"incident_id": self.incident, "label": "correct"},
++            {"incident_id": self.incident, "label": "incorrect", "true_class": "slow_fire"},
++            {"incident_id": self.incident, "label": "maybe"},
++        ):
++            with self.assertRaises(HTTPError) as err:
++                self.post(base, "/api/labels", bad)
++            self.assertEqual(err.exception.code, 400)
++        with self.assertRaises(HTTPError) as err:
++            self.post(base, "/api/labels", {"incident_id": "nope", "label": "incorrect"})
++        self.assertEqual(err.exception.code, 404)
++        self.post(base, "/api/labels", {"incident_id": self.incident, "label": "incorrect"})
++        item = self.store.incidents()["incidents"][0]
++        self.assertEqual(item["label"], {"label": "incorrect", "true_class": "normal", "source": "manual"})
++
++    def test_scenario_truth_labels_and_manual_wins(self):
++        base_ms = rd._ts_ms(iso_minute(0))
++        dust = {"escenario": "polvo_tractor", "alarma_esperada": False, "t0_s": 0}
++        self.assertEqual(self.store.load_truth("r1", dust), 1)
++        label = self.store.incidents()["incidents"][0]["label"]
++        self.assertEqual((label["label"], label["true_class"], label["source"]), ("incorrect", "dust", "scenario"))
++        t0 = (base_ms - BASE_MS) // 1000 - 60  # fire starts before the first alarm
++        fire = {"escenario": "fuego_lento", "alarma_esperada": True, "t0_s": t0}
++        self.store.load_truth("r1", fire)
++        label = self.store.incidents()["incidents"][0]["label"]
++        self.assertEqual((label["label"], label["true_class"]), ("correct", "slow_fire"))
++        early = {"escenario": "fuego_lento", "alarma_esperada": True, "t0_s": t0 + 3600}
++        self.store.load_truth("r1", early)  # alarm before the fire existed
++        label = self.store.incidents()["incidents"][0]["label"]
++        self.assertEqual((label["label"], label["true_class"]), ("incorrect", "normal"))
++        self.store.set_label(self.incident, "correct", "fast_fire")
++        label = self.store.incidents()["incidents"][0]["label"]
++        self.assertEqual((label["true_class"], label["source"]), ("fast_fire", "manual"))
++
++    def test_export_is_accepted_by_train_and_excludes_ambiguous_gap(self):
++        base = rd._ts_ms(iso_minute(0))
++        items = []
++        for n in (496, 497):
++            for seq, minute in enumerate((-20, -15, -5, 1, 3, 5)):
++                items.append(
++                    {
++                        "id": n, "ts": base + minute * 60_000, "seq": seq, "boot_id": "b",
++                        "kind": "periodic",
++                        "values": {"PM2.5": 90.0, "PM10": 140.0, "temperature": 30.0, "humidity": 40.0},
++                    }
++                )
++        self.store.ingest_readings(batch(items))
++        self.store.set_label(self.incident, "correct", "slow_fire")
++        out = Path(self.temp.name) / "reviewed.jsonl"
++        n = self.store.export_training(out)
++        rows = [json.loads(line) for line in out.read_text().splitlines()]
++        self.assertEqual(n, len(rows))
++        classes = {}
++        for row in rows:
++            key = (row["message"]["node_id"], row["message"]["timestamp"][11:16])
++            classes[key] = row["class"]
++        self.assertEqual(classes[("node_0496", "18:40")], "normal")  # -20 min: clean context
++        self.assertNotIn(("node_0496", "18:55"), classes)  # -5 min: ambiguous gap
++        self.assertEqual(classes[("node_0496", "19:01")], "slow_fire")
++        self.assertEqual(len(list(reviewed_history(out))), len(rows))  # train.py parser accepts it
++
++    def test_unlabelled_incidents_are_not_exported(self):
++        out = Path(self.temp.name) / "none.jsonl"
++        self.assertEqual(self.store.export_training(out), 0)
++
++    def test_nodes_zones_and_zone_summary(self):
++        nodes = self.store.nodes()
++        self.assertEqual(len(nodes), 1024)
++        self.assertEqual(rd.grid_position("node_0496"), ("z_3_3", 15, 15))
++        self.assertEqual(rd.grid_position(1025), None)
++        good = {
++            "event_id": "z1", "generated_at": "2026-11-20T19:00:00+00:00",
++            "computed_by": "edge", "zone": "z_3_3", "from_ts": 1, "to_ts": 2,
++            "n": 10, "mean_pm25": 20.0, "max_pm25": 80.0, "max_node_id": "node_0496",
++        }
++        self.assertEqual(self.store.ingest_summary(json.dumps(good).encode())[0], "inserted")
++        cloud = {**good, "event_id": "z2", "computed_by": "cloud", "zone": "z_0_0",
++                 "samples": [{"node_id": 1, "pm25": 5.0}, {"node_id": 2, "pm25": 9.0}]}
++        for k in ("n", "mean_pm25", "max_pm25", "max_node_id"):
++            cloud.pop(k)
++        self.assertEqual(self.store.ingest_summary(json.dumps(cloud).encode())[0], "inserted")
++        zones = {z["zone"]: z for z in self.store.zones()}
++        self.assertEqual(zones["z_0_0"]["max_node_id"], "node_0002")
++        self.assertEqual(zones["z_3_3"]["max_pm25"], 80.0)
++        bad = {**good, "event_id": "z3", "zone": "bogus"}
++        self.assertEqual(self.store.ingest_summary(json.dumps(bad).encode())[0], "invalid")
++        legacy = {"event_id": "l1", "generated_at": "x", "computed_by": "edge",
++                  "n": 3, "mean_pm25": 1.0, "max_pm25": 2.0}
++        self.assertEqual(self.store.ingest_summary(json.dumps(legacy).encode())[0], "inserted")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/demos/edge1000-v4/tests/test_readings.py b/demos/edge1000-v4/tests/test_readings.py
+new file mode 100644
+index 0000000..99b3b37
+--- /dev/null
++++ b/demos/edge1000-v4/tests/test_readings.py
+@@ -0,0 +1,132 @@
++"""Reading batches: validation, idempotency, bounded window, propagation timeline."""
++
++import json
++import tempfile
++import threading
++import unittest
++from http.server import ThreadingHTTPServer
++from pathlib import Path
++from urllib.error import HTTPError
++from urllib.request import urlopen
++
++from cloud import readings as rd
++from cloud.app import AlertStore, TOPIC, BrokerStatus, build_handler
++
++T0 = 1784124000000
++
++
++def reading(node, seq, t_s, pm25=10.0, boot="b1"):
++    return {
++        "id": node,
++        "ts": T0 + t_s * 1000,
++        "seq": seq,
++        "boot_id": boot,
++        "kind": "periodic",
++        "values": {"PM2.5": pm25, "PM10": pm25 * 1.6, "temperature": 20.0, "humidity": 50.0},
++    }
++
++
++def batch(items, ident="b-1", run="r1"):
++    return json.dumps({"batch_id": ident, "run_id": run, "readings": items}).encode()
++
++
++def alert(ident, node, minute, run="r1"):
++    return json.dumps(
++        {
++            "event_id": ident,
++            "node_id": node,
++            "type": "environmental_alert",
++            "decision": "suspected_fire",
++            "run_id": run,
++            "priority": "high",
++            "fire_score": 0.9,
++            "generated_at": "2026-11-20T19:00:00+00:00",
++            "reading_timestamp": f"2026-11-20T19:{minute:02d}:00+00:00",
++        }
++    ).encode()
++
++
++class ReadingsTest(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.store = AlertStore(Path(self.temp.name) / "cloud.sqlite")
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def test_node_names_and_validation(self):
++        self.assertEqual(rd.node_name(496), "node_0496")
++        self.assertEqual(rd.node_name("node_0496"), "node_0496")
++        self.assertIsNone(rd.node_name(0))
++        self.assertIsNone(rd.node_name(True))
++        bad = [reading(0, 1, 0), {**reading(1, 1, 0), "values": {}}, {**reading(1, 1, 0), "seq": -1}]
++        for item in bad:
++            self.assertEqual(self.store.ingest_readings(batch([item]))[0], "invalid")
++        self.assertEqual(self.store.ingest_readings(b"not json")[0], "invalid")
++        self.assertEqual(self.store.ingest_readings(b"")[0], "invalid")
++        self.assertEqual(self.store.stats()["stored_readings"], 0)
++
++    def test_batch_is_idempotent_and_deduplicates_readings(self):
++        items = [reading(496, s, s * 10) for s in range(5)]
++        self.assertEqual(self.store.ingest_readings(batch(items)), ("inserted", "b-1", 5, 0))
++        self.assertEqual(self.store.ingest_readings(batch(items)), ("duplicate", "b-1", 0, 5))
++        overlap = batch(items[3:] + [reading(496, 5, 50)], "b-2")
++        self.assertEqual(self.store.ingest_readings(overlap), ("inserted", "b-2", 1, 2))
++        self.assertEqual(self.store.stats()["stored_readings"], 6)
++        self.assertEqual(self.store.stats()["reading_nodes"], 1)
++
++    def test_same_seq_after_reboot_is_new_reading(self):
++        self.store.ingest_readings(batch([reading(7, 1, 0, boot="a")]))
++        self.store.ingest_readings(batch([reading(7, 1, 10, boot="b")], "b-2"))
++        self.assertEqual(self.store.stats()["stored_readings"], 2)
++
++    def test_window_purges_old_readings_per_run(self):
++        self.store.ingest_readings(batch([reading(1, 1, 0)], "a"), window_s=60)
++        self.store.ingest_readings(batch([reading(1, 1, 0)], "c", run="other"), window_s=60)
++        self.store.ingest_readings(batch([reading(1, 2, 120)], "b"), window_s=60)
++        rows = self.store.readings(run_id="r1")
++        self.assertEqual([r["seq"] for r in rows], [2])
++        self.assertEqual(len(self.store.readings(run_id="other")), 1)
++
++    def test_query_filters(self):
++        items = [reading(n, s, s * 10) for n in (1, 2) for s in range(4)]
++        self.store.ingest_readings(batch(items))
++        only = self.store.readings(run_id="r1", node_id="node_0002", since_ms=T0 + 10_000)
++        self.assertEqual(len(only), 3)
++        self.assertTrue(all(r["node_id"] == "node_0002" for r in only))
++        self.assertEqual(len(self.store.readings(limit=2)), 2)
++
++    def test_incident_timeline_and_peak(self):
++        for ident, node, minute in (("a", "node_0496", 0), ("b", "node_0497", 4), ("c", "node_0529", 9)):
++            self.assertEqual(self.store.ingest(TOPIC, alert(ident, node, minute)), "inserted")
++        base = 1795201200000  # 2026-11-20T19:00:00Z
++        items = [
++            {**reading(496, 1, 0, pm25=80.0), "ts": base + 2 * 60_000},
++            {**reading(497, 1, 0, pm25=140.0), "ts": base + 5 * 60_000},
++            {**reading(1000, 1, 0, pm25=999.0), "ts": base + 5 * 60_000},
++        ]
++        self.store.ingest_readings(batch(items))
++        incident = self.store.incidents()["incidents"][0]
++        self.assertEqual(incident["first_node"], "node_0496")
++        self.assertEqual([s["node"] for s in incident["timeline"]], ["node_0496", "node_0497", "node_0529"])
++        self.assertEqual([s["offset_s"] for s in incident["timeline"]], [0.0, 240.0, 540.0])
++        self.assertEqual(incident["duration_s"], 540.0)
++        self.assertEqual(incident["peak_pm25"], 140.0)
++
++    def test_http_readings_endpoint(self):
++        self.store.ingest_readings(batch([reading(496, 1, 0), reading(497, 1, 0)]))
++        server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(self.store, BrokerStatus()))
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        self.addCleanup(server.server_close)
++        self.addCleanup(server.shutdown)
++        base = f"http://127.0.0.1:{server.server_port}/api/readings"
++        with urlopen(base + "?node_id=496") as response:
++            data = json.load(response)
++        self.assertEqual([r["node_id"] for r in data["readings"]], ["node_0496"])
++        with self.assertRaises(HTTPError) as caught:
++            urlopen(base + "?since=abc")
++        self.assertEqual(caught.exception.code, 400)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/demos/edge1000-v4/tests/test_retrain.py b/demos/edge1000-v4/tests/test_retrain.py
+new file mode 100644
+index 0000000..8140977
+--- /dev/null
++++ b/demos/edge1000-v4/tests/test_retrain.py
+@@ -0,0 +1,136 @@
++"""Retraining trigger, gate-controlled promotion and rollback (training is injected)."""
++
++import json
++import tempfile
++import threading
++import unittest
++from http.server import ThreadingHTTPServer
++from pathlib import Path
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
++
++from cloud.app import AlertStore, BrokerStatus, TOPIC, build_handler
++from cloud.retrain import Retrainer
++from tests.test_readings import alert, batch, reading
++
++
++def model_file(path, version):
++    Path(path).write_text(json.dumps({"version": version}), encoding="utf-8")
++
++
++class RetrainTest(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        root = Path(self.temp.name)
++        self.store = AlertStore(root / "c.sqlite")
++        self.model = root / "forest.json"
++        model_file(self.model, "rf-base")
++        self.approved = True
++        self.promoted = []
++        self.counter = 0
++
++        def train(extra, output):
++            self.counter += 1
++            model_file(output, f"rf-new{self.counter}")
++
++        def gate(candidate, baseline, report):
++            return {"approved": self.approved, "same_version": False, "reasons": [] if self.approved else ["macro_f1_regression"],
++                    "baseline_model": "rf-base"}
++
++        def promote(src, target):
++            self.promoted.append(Path(src).name)
++            Path(target).write_bytes(Path(src).read_bytes())
++
++        self.rt = Retrainer(self.store, root / "work", self.model, trigger_labels=2,
++                            train_fn=train, gate_fn=gate, promote_fn=promote,
++                            scenario_fn=lambda c, b: self.scenarios)
++        self.scenarios = {"approved": True, "candidate": {"passed": 9, "total": 9, "failed": []}}
++        self.store.on_labels = self.rt.maybe_trigger
++        # one labelled incident with readings around the alarm
++        self.store.ingest(TOPIC, alert("a", "node_0496", 0))
++        base = 1795201200000
++        self.store.ingest_readings(batch([
++            {**reading(496, s, 0, pm25=60.0), "ts": base + s * 10_000} for s in range(1, 40)
++        ]))
++        self.incident = self.store.incidents()["incidents"][0]["incident_id"]
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def test_initial_registry_and_no_data(self):
++        state = self.rt.state()
++        self.assertEqual([(m["version"], m["status"]) for m in state["models"]], [("rf-base", "active")])
++        self.assertEqual(self.rt.run("manual")["result"], "no_data")
++
++    def test_trigger_needs_enough_labels(self):
++        self.store.set_label(self.incident, "incorrect", "normal")
++        self.assertEqual(self.rt.pending_labels(), 1)
++        self.assertFalse(self.rt.maybe_trigger())
++
++    def test_candidate_promote_and_rollback(self):
++        self.store.set_label(self.incident, "incorrect", "normal")
++        out = self.rt.run("manual")
++        self.assertEqual((out["result"], out["model_version"]), ("candidate", "rf-new1"))
++        self.assertEqual(self.rt.pending_labels(), 0)
++        self.assertEqual(self.rt.promote("rf-new1"), "rf-new1")
++        status = {m["version"]: m["status"] for m in self.rt.state()["models"]}
++        self.assertEqual(status, {"rf-base": "previous", "rf-new1": "active"})
++        self.assertEqual(json.loads(self.model.read_text())["version"], "rf-new1")
++        self.assertEqual(self.rt.rollback(), "rf-base")
++        status = {m["version"]: m["status"] for m in self.rt.state()["models"]}
++        self.assertEqual(status, {"rf-base": "active", "rf-new1": "candidate"})
++
++    def test_rejected_candidate_cannot_be_promoted(self):
++        self.store.set_label(self.incident, "incorrect", "normal")
++        self.approved = False
++        out = self.rt.run("manual")
++        self.assertEqual((out["result"], out["model_version"]), ("rejected", "rf-new1"))
++        with self.assertRaises(ValueError):
++            self.rt.promote("rf-new1")
++        with self.assertRaises(ValueError):
++            self.rt.rollback()
++        self.assertEqual(json.loads(self.model.read_text())["version"], "rf-base")
++
++    def test_scenario_regression_rejects_candidate(self):
++        self.store.set_label(self.incident, "incorrect", "normal")
++        self.scenarios = {"approved": False, "regressions": ["niebla"],
++                          "candidate": {"passed": 8, "total": 9, "failed": ["niebla"]}}
++        out = self.rt.run("manual")
++        self.assertEqual(out["result"], "rejected")
++        metrics = {m["version"]: m for m in self.rt.state()["models"]}["rf-new1"]["metrics"]
++        self.assertIn("scenario_regression:niebla", metrics["reasons"])
++        self.assertEqual(metrics["scenarios"]["failed"], ["niebla"])
++        with self.assertRaises(ValueError):
++            self.rt.promote("rf-new1")
++
++    def test_training_failure_is_recorded_not_fatal(self):
++        self.store.set_label(self.incident, "incorrect", "normal")
++        self.rt.train_fn = lambda extra, output: (_ for _ in ()).throw(RuntimeError("boom"))
++        self.assertTrue(self.rt.run("manual")["result"].startswith("error"))
++        self.assertEqual(self.rt.state()["runs"][0]["result"], "error: RuntimeError")
++
++    def test_http_models_and_actions(self):
++        srv = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(self.store, BrokerStatus(), self.rt))
++        threading.Thread(target=srv.serve_forever, daemon=True).start()
++        self.addCleanup(srv.server_close)
++        self.addCleanup(srv.shutdown)
++        base = f"http://127.0.0.1:{srv.server_port}"
++        with urlopen(base + "/api/models") as r:
++            self.assertEqual(json.load(r)["models"][0]["version"], "rf-base")
++        self.store.set_label(self.incident, "incorrect", "normal")
++        self.rt.run("manual")
++
++        def post(path, body):
++            return urlopen(Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"}))
++
++        with post("/api/models/promote", {"version": "rf-new1"}) as r:
++            self.assertEqual(json.load(r)["active"], "rf-new1")
++        with post("/api/models/rollback", {"x": 1}) as r:
++            self.assertEqual(json.load(r)["active"], "rf-base")
++        with self.assertRaises(HTTPError) as err:
++            post("/api/models/promote", {"version": "nope"})
++        self.assertEqual(err.exception.code, 400)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/demos/edge1000-v4/tests/test_scenario_gate.py b/demos/edge1000-v4/tests/test_scenario_gate.py
+new file mode 100644
+index 0000000..e21a3c7
+--- /dev/null
++++ b/demos/edge1000-v4/tests/test_scenario_gate.py
+@@ -0,0 +1,22 @@
++"""The deployed model must pass the team's nine scenarios (external to the training generator)."""
++
++import unittest
++
++from edge.model import ROOT
++from lab.scenario_gate import DEFAULT_DIR, SCENARIOS, compare, run_all
++
++
++@unittest.skipUnless(DEFAULT_DIR.exists(), "scenario files not present")
++class ScenarioGateTest(unittest.TestCase):
++    def test_deployed_model_passes_all_nine(self):
++        report = run_all(ROOT / "models/forest.json")
++        self.assertEqual(report["total"], len(SCENARIOS))
++        self.assertEqual(report["failed"], [], report["results"])
++
++    def test_same_model_is_not_a_regression(self):
++        model = ROOT / "models/forest.json"
++        self.assertTrue(compare(model, model)["approved"])
++
++
++if __name__ == "__main__":
++    unittest.main()
